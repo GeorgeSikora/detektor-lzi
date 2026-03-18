@@ -4,6 +4,10 @@
 
 namespace {
 constexpr uint8_t GSR_PIN = A0;
+constexpr uint8_t ECG_PIN = A1;
+constexpr uint8_t ECG_LO_MINUS_PIN = 2;
+constexpr uint8_t ECG_LO_PLUS_PIN = 3;
+constexpr uint8_t BUZZER_PIN = 5;
 constexpr uint8_t LCD_TEXT_ADDR = 0x3E;
 constexpr uint8_t LCD_BACKLIGHT_ADDR_PRIMARY = 0x62;
 constexpr uint8_t LCD_BACKLIGHT_ADDR_ALT = 0x60;
@@ -13,10 +17,18 @@ constexpr uint8_t LCD_COLS = 16;
 constexpr uint8_t LCD_ROWS = 2;
 
 constexpr unsigned long GSR_SAMPLE_INTERVAL_MS = 250;
+constexpr unsigned long ECG_SAMPLE_INTERVAL_MS = 4;
 constexpr unsigned long DISPLAY_REFRESH_INTERVAL_MS = 500;
 constexpr unsigned long SERIAL_PRINT_INTERVAL_MS = 1000;
 constexpr unsigned long OXIMETER_READ_INTERVAL_MS = 4000;
 constexpr unsigned long OXIMETER_RETRY_INTERVAL_MS = 5000;
+constexpr unsigned long ECG_MIN_BEAT_INTERVAL_MS = 300;
+constexpr unsigned long ECG_MAX_BEAT_INTERVAL_MS = 1500;
+constexpr unsigned long ECG_SIGNAL_TIMEOUT_MS = 3000;
+constexpr unsigned long BUZZER_BEEP_DURATION_MS = 30;
+constexpr unsigned int BUZZER_FREQUENCY_HZ = 2400;
+constexpr unsigned long BUZZER_TEST_DURATION_MS = 180;
+constexpr unsigned int BUZZER_TEST_FREQUENCY_HZ = 1800;
 
 constexpr uint8_t LCD_CLEARDISPLAY = 0x01;
 constexpr uint8_t LCD_RETURNHOME = 0x02;
@@ -156,15 +168,34 @@ bool oximeterReady = false;
 uint8_t lcdBacklightAddress = LCD_BACKLIGHT_ADDR_PRIMARY;
 
 int gsrValue = 0;
+int ecgValue = 0;
+int ecgHeartRate = -1;
+int oximeterHeartRate = -1;
 int heartRate = -1;
 int spo2 = -1;
 int boardTempC = -1;
+bool ecgLeadsOff = true;
+bool ecgTrackingReady = false;
+bool ecgPeakArmed = false;
+bool buzzerActive = false;
+bool buzzerEnabled = true;
+
+int ecgFiltered = 0;
+int ecgBaseline = 512;
+int ecgEnvelope = 0;
+int ecgPreviousFiltered = 0;
+int ecgPreviousDelta = 0;
 
 unsigned long lastGsrSampleMs = 0;
+unsigned long lastEcgSampleMs = 0;
 unsigned long lastDisplayRefreshMs = 0;
 unsigned long lastSerialPrintMs = 0;
 unsigned long lastOximeterReadMs = 0;
 unsigned long lastOximeterRetryMs = 0;
+unsigned long lastEcgBeatMs = 0;
+unsigned long lastValidEcgBeatMs = 0;
+unsigned long lastBuzzerStartMs = 0;
+unsigned long buzzerDurationMs = 0;
 
 bool probeI2C(uint8_t address) {
 	Wire.beginTransmission(address);
@@ -207,6 +238,123 @@ int sampleGsr() {
 		delayMicroseconds(300);
 	}
 	return static_cast<int>(total / 8);
+	}
+
+bool isEcgLeadOff() {
+	return digitalRead(ECG_LO_MINUS_PIN) == HIGH || digitalRead(ECG_LO_PLUS_PIN) == HIGH;
+	}
+
+void syncHeartRateSource() {
+	if (ecgHeartRate > 0) {
+		heartRate = ecgHeartRate;
+	} else {
+		heartRate = oximeterHeartRate;
+	}
+	}
+
+void startBuzzerTone(unsigned int frequencyHz, unsigned long durationMs, unsigned long now) {
+	if (!buzzerEnabled) {
+		return;
+	}
+	tone(BUZZER_PIN, frequencyHz);
+	buzzerActive = true;
+	lastBuzzerStartMs = now;
+	buzzerDurationMs = durationMs;
+	}
+
+void startBeatBeep(unsigned long now) {
+	startBuzzerTone(BUZZER_FREQUENCY_HZ, BUZZER_BEEP_DURATION_MS, now);
+	}
+
+void triggerBuzzerTest(unsigned long now) {
+	startBuzzerTone(BUZZER_TEST_FREQUENCY_HZ, BUZZER_TEST_DURATION_MS, now);
+	}
+
+void updateBuzzer(unsigned long now) {
+	if (!buzzerActive) {
+		return;
+	}
+	if (now - lastBuzzerStartMs >= buzzerDurationMs) {
+		noTone(BUZZER_PIN);
+		buzzerActive = false;
+		buzzerDurationMs = 0;
+	}
+	}
+
+void resetEcgTracking() {
+	ecgTrackingReady = false;
+	ecgPeakArmed = false;
+	ecgHeartRate = -1;
+	ecgEnvelope = 0;
+	ecgPreviousDelta = 0;
+	if (buzzerActive) {
+		noTone(BUZZER_PIN);
+		buzzerActive = false;
+		buzzerDurationMs = 0;
+	}
+	syncHeartRateSource();
+	}
+
+void updateEcg(unsigned long now) {
+	ecgLeadsOff = isEcgLeadOff();
+	if (ecgLeadsOff) {
+		resetEcgTracking();
+		return;
+	}
+
+	const int rawValue = analogRead(ECG_PIN);
+	ecgValue = rawValue;
+
+	if (!ecgTrackingReady) {
+		ecgFiltered = rawValue;
+		ecgBaseline = rawValue;
+		ecgPreviousFiltered = rawValue;
+		ecgTrackingReady = true;
+		return;
+	}
+
+	ecgFiltered = (ecgFiltered * 3 + rawValue) / 4;
+	ecgBaseline = (ecgBaseline * 31 + ecgFiltered) / 32;
+
+	const int signal = ecgFiltered - ecgBaseline;
+	const int absoluteSignal = abs(signal);
+	if (absoluteSignal > ecgEnvelope) {
+		ecgEnvelope = absoluteSignal;
+	} else {
+		ecgEnvelope = (ecgEnvelope * 15 + absoluteSignal) / 16;
+	}
+
+	int detectionThreshold = ecgEnvelope / 2;
+	if (detectionThreshold < 12) {
+		detectionThreshold = 12;
+	}
+
+	const int delta = ecgFiltered - ecgPreviousFiltered;
+	if (!ecgPeakArmed && signal > detectionThreshold) {
+		ecgPeakArmed = true;
+	}
+
+	const bool fallingEdgePeak = ecgPeakArmed && ecgPreviousDelta > 0 && delta <= 0 && signal > detectionThreshold;
+	if (fallingEdgePeak) {
+		const unsigned long beatIntervalMs = now - lastEcgBeatMs;
+		if (lastEcgBeatMs == 0 || beatIntervalMs >= ECG_MIN_BEAT_INTERVAL_MS) {
+			if (lastEcgBeatMs != 0 && beatIntervalMs <= ECG_MAX_BEAT_INTERVAL_MS) {
+				ecgHeartRate = static_cast<int>(60000UL / beatIntervalMs);
+				lastValidEcgBeatMs = now;
+			}
+			lastEcgBeatMs = now;
+			startBeatBeep(now);
+		}
+		ecgPeakArmed = false;
+	}
+
+	if (now - lastValidEcgBeatMs > ECG_SIGNAL_TIMEOUT_MS) {
+		ecgHeartRate = -1;
+	}
+
+	ecgPreviousFiltered = ecgFiltered;
+	ecgPreviousDelta = delta;
+	syncHeartRateSource();
 	}
 
 bool initLcd() {
@@ -277,16 +425,22 @@ void refreshDisplay() {
 	}
 
 	char hrBuffer[6];
+	char ecgBuffer[6];
 	char spo2Buffer[6];
 	char tempBuffer[6];
 	char line1[17];
 	char line2[17];
 
 	formatMaybeInt(hrBuffer, sizeof(hrBuffer), heartRate);
+	if (ecgLeadsOff) {
+		snprintf(ecgBuffer, sizeof(ecgBuffer), "OFF");
+	} else {
+		snprintf(ecgBuffer, sizeof(ecgBuffer), "%d", ecgValue);
+	}
 	formatMaybeInt(spo2Buffer, sizeof(spo2Buffer), spo2);
 	formatMaybeInt(tempBuffer, sizeof(tempBuffer), boardTempC);
 
-	snprintf(line1, sizeof(line1), "GSR %4d HR %3s", gsrValue, hrBuffer);
+	snprintf(line1, sizeof(line1), "G%4d H%3s E%4s", gsrValue, hrBuffer, ecgBuffer);
 	snprintf(line2, sizeof(line2), "O2 %3s%% T%2sC", spo2Buffer, tempBuffer);
 
 	lcd.setCursor(0, 0);
@@ -302,9 +456,22 @@ void refreshDisplay() {
 void printStatusToSerial() {
 	Serial.print(F("GSR="));
 	Serial.print(gsrValue);
+	Serial.print(F(" | ECG="));
+	if (ecgLeadsOff) {
+		Serial.print(F("LEADS_OFF"));
+	} else {
+		Serial.print(ecgValue);
+	}
 	Serial.print(F(" | HR="));
 	if (heartRate >= 0) {
 		Serial.print(heartRate);
+		Serial.print(F(" bpm"));
+	} else {
+		Serial.print(F("--"));
+	}
+	Serial.print(F(" | HR_OX="));
+	if (oximeterHeartRate >= 0) {
+		Serial.print(oximeterHeartRate);
 		Serial.print(F(" bpm"));
 	} else {
 		Serial.print(F("--"));
@@ -327,6 +494,7 @@ void printStatusToSerial() {
 	Serial.print(lcdReady ? F("OK") : F("ERR"));
 	Serial.print(F(" | OX="));
 	Serial.println(oximeterReady ? F("OK") : F("WAIT"));
+	Serial.println(F("Cmd: s=scan, c=clear, b=buzzer test"));
 	}
 
 void updateOximeter() {
@@ -334,9 +502,10 @@ void updateOximeter() {
 		return;
 	}
 	oximeter.getHeartbeatSPO2();
-	heartRate = oximeter._sHeartbeatSPO2.Heartbeat;
+	oximeterHeartRate = oximeter._sHeartbeatSPO2.Heartbeat;
 	spo2 = oximeter._sHeartbeatSPO2.SPO2;
 	boardTempC = static_cast<int>(oximeter.getTemperature_C() + 0.5f);
+	syncHeartRateSource();
 	}
 } // namespace
 
@@ -347,12 +516,17 @@ void setup() {
 	}
 
 	pinMode(GSR_PIN, INPUT);
+	pinMode(ECG_PIN, INPUT);
+	pinMode(ECG_LO_MINUS_PIN, INPUT);
+	pinMode(ECG_LO_PLUS_PIN, INPUT);
+	pinMode(BUZZER_PIN, OUTPUT);
+	noTone(BUZZER_PIN);
 	Wire.begin();
 	Wire.setClock(100000);
 
 	Serial.println();
 	Serial.println(F("Detektor LZI"));
-	Serial.println(F("UNO: SDA=A4, SCL=A5, GSR=A0"));
+	Serial.println(F("UNO: SDA=A4, SCL=A5, GSR=A0, AD8232=A1 D2 D3, BUZ=D5"));
 	scanI2CBus();
 
 	lcdReady = initLcd();
@@ -367,6 +541,7 @@ void setup() {
 
 	const unsigned long now = millis();
 	lastGsrSampleMs = now;
+	lastEcgSampleMs = now;
 	lastDisplayRefreshMs = now;
 	lastSerialPrintMs = now;
 	lastOximeterReadMs = now - OXIMETER_READ_INTERVAL_MS;
@@ -379,6 +554,11 @@ void loop() {
 	if (now - lastGsrSampleMs >= GSR_SAMPLE_INTERVAL_MS) {
 		gsrValue = sampleGsr();
 		lastGsrSampleMs = now;
+	}
+
+	if (now - lastEcgSampleMs >= ECG_SAMPLE_INTERVAL_MS) {
+		updateEcg(now);
+		lastEcgSampleMs = now;
 	}
 
 	if (!oximeterReady && now - lastOximeterRetryMs >= OXIMETER_RETRY_INTERVAL_MS) {
@@ -402,6 +582,8 @@ void loop() {
 		lastSerialPrintMs = now;
 	}
 
+	updateBuzzer(now);
+
 	if (Serial.available() > 0) {
 		const char command = static_cast<char>(Serial.read());
 		if (command == 's' || command == 'S') {
@@ -410,6 +592,9 @@ void loop() {
 			if (lcdReady) {
 				lcd.clear();
 			}
+		} else if (command == 'b' || command == 'B') {
+			triggerBuzzerTest(now);
+			Serial.println(F("Buzzer test"));
 		}
 	}
 	}
