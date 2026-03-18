@@ -8,6 +8,8 @@ constexpr uint8_t ECG_PIN = A1;
 constexpr uint8_t ECG_LO_MINUS_PIN = 2;
 constexpr uint8_t ECG_LO_PLUS_PIN = 3;
 constexpr uint8_t BUZZER_PIN = 5;
+constexpr uint8_t START_BUTTON_PIN = 8;
+constexpr uint8_t STOP_BUTTON_PIN = 9;
 constexpr uint8_t LCD_TEXT_ADDR = 0x3E;
 constexpr uint8_t LCD_BACKLIGHT_ADDR_PRIMARY = 0x62;
 constexpr uint8_t LCD_BACKLIGHT_ADDR_ALT = 0x60;
@@ -29,6 +31,20 @@ constexpr unsigned long BUZZER_BEEP_DURATION_MS = 30;
 constexpr unsigned int BUZZER_FREQUENCY_HZ = 2400;
 constexpr unsigned long BUZZER_TEST_DURATION_MS = 180;
 constexpr unsigned int BUZZER_TEST_FREQUENCY_HZ = 1800;
+constexpr unsigned long BUTTON_DEBOUNCE_MS = 50;
+constexpr unsigned long STARTUP_NOTE_DURATION_MS = 85;
+constexpr unsigned long MODE_SWITCH_NOTE_DURATION_MS = 55;
+constexpr unsigned long TONE_GAP_DURATION_MS = 20;
+constexpr unsigned long BASELINE_CAPTURE_MS = 8000;
+constexpr int HR_LIE_DELTA_BPM = 12;
+constexpr int GSR_LIE_DELTA = 45;
+
+constexpr uint8_t MENU_BACKLIGHT_RED = 255;
+constexpr uint8_t MENU_BACKLIGHT_GREEN = 180;
+constexpr uint8_t MENU_BACKLIGHT_BLUE = 0;
+constexpr uint8_t PAUSED_BACKLIGHT_RED = 255;
+constexpr uint8_t PAUSED_BACKLIGHT_GREEN = 200;
+constexpr uint8_t PAUSED_BACKLIGHT_BLUE = 0;
 
 constexpr uint8_t LCD_CLEARDISPLAY = 0x01;
 constexpr uint8_t LCD_RETURNHOME = 0x02;
@@ -160,12 +176,26 @@ private:
 	bool _available = false;
 };
 
+enum class DeviceMode : uint8_t {
+	Standby,
+	Measuring,
+	Paused,
+};
+
+enum class Verdict : uint8_t {
+	Calibrating,
+	Truth,
+	Lie,
+};
+
 RgbLcd lcd;
 DFRobot_BloodOxygen_S_I2C oximeter(&Wire, OXIMETER_ADDR);
 
 bool lcdReady = false;
 bool oximeterReady = false;
 uint8_t lcdBacklightAddress = LCD_BACKLIGHT_ADDR_PRIMARY;
+DeviceMode deviceMode = DeviceMode::Standby;
+Verdict verdict = Verdict::Calibrating;
 
 int gsrValue = 0;
 int ecgValue = 0;
@@ -185,6 +215,12 @@ int ecgBaseline = 512;
 int ecgEnvelope = 0;
 int ecgPreviousFiltered = 0;
 int ecgPreviousDelta = 0;
+int baselineGsr = -1;
+int baselineHeartRate = -1;
+long baselineGsrSum = 0;
+long baselineHeartRateSum = 0;
+uint16_t baselineGsrSamples = 0;
+uint16_t baselineHeartRateSamples = 0;
 
 unsigned long lastGsrSampleMs = 0;
 unsigned long lastEcgSampleMs = 0;
@@ -196,6 +232,18 @@ unsigned long lastEcgBeatMs = 0;
 unsigned long lastValidEcgBeatMs = 0;
 unsigned long lastBuzzerStartMs = 0;
 unsigned long buzzerDurationMs = 0;
+unsigned long lastStartButtonChangeMs = 0;
+unsigned long lastStopButtonChangeMs = 0;
+unsigned long measurementStartedMs = 0;
+
+bool lastStartButtonReading = HIGH;
+bool lastStopButtonReading = HIGH;
+bool startButtonState = HIGH;
+bool stopButtonState = HIGH;
+
+void refreshDisplay();
+void updateBacklight();
+void updateVerdict(unsigned long now);
 
 bool probeI2C(uint8_t address) {
 	Wire.beginTransmission(address);
@@ -230,6 +278,26 @@ void scanI2CBus() {
 	}
 	Serial.println(F("=== I2C scan end ==="));
 }
+
+void writeLcdLine(uint8_t row, const char *text) {
+	if (!lcd.available()) {
+		return;
+	}
+
+	lcd.setCursor(0, row);
+	const size_t length = strlen(text);
+	for (uint8_t i = 0; i < LCD_COLS; ++i) {
+		lcd.write(i < length ? text[i] : ' ');
+	}
+	}
+
+void showStatusScreen(const char *secondLine) {
+	if (!lcdReady) {
+		return;
+	}
+	writeLcdLine(0, "Detektor lzi");
+	writeLcdLine(1, secondLine);
+	}
 
 int sampleGsr() {
 	long total = 0;
@@ -270,6 +338,36 @@ void triggerBuzzerTest(unsigned long now) {
 	startBuzzerTone(BUZZER_TEST_FREQUENCY_HZ, BUZZER_TEST_DURATION_MS, now);
 	}
 
+void playToneStep(unsigned int frequencyHz, unsigned long durationMs) {
+	if (!buzzerEnabled) {
+		return;
+	}
+	tone(BUZZER_PIN, frequencyHz);
+	delay(durationMs);
+	noTone(BUZZER_PIN);
+	delay(TONE_GAP_DURATION_MS);
+	}
+
+void playStartupMelody() {
+	playToneStep(1047, STARTUP_NOTE_DURATION_MS);
+	playToneStep(1319, STARTUP_NOTE_DURATION_MS);
+	playToneStep(1568, STARTUP_NOTE_DURATION_MS);
+	playToneStep(1760, STARTUP_NOTE_DURATION_MS);
+	playToneStep(2093, STARTUP_NOTE_DURATION_MS + 10);
+	playToneStep(1760, STARTUP_NOTE_DURATION_MS);
+	playToneStep(1568, STARTUP_NOTE_DURATION_MS + 20);
+	}
+
+void playStartMeasurementTone() {
+	playToneStep(1480, MODE_SWITCH_NOTE_DURATION_MS);
+	playToneStep(1760, MODE_SWITCH_NOTE_DURATION_MS + 10);
+	}
+
+void playPauseMeasurementTone() {
+	playToneStep(1760, MODE_SWITCH_NOTE_DURATION_MS);
+	playToneStep(1397, MODE_SWITCH_NOTE_DURATION_MS + 10);
+	}
+
 void updateBuzzer(unsigned long now) {
 	if (!buzzerActive) {
 		return;
@@ -281,18 +379,135 @@ void updateBuzzer(unsigned long now) {
 	}
 	}
 
+void stopBuzzer() {
+	if (!buzzerActive) {
+		return;
+	}
+	noTone(BUZZER_PIN);
+	buzzerActive = false;
+	buzzerDurationMs = 0;
+	}
+
 void resetEcgTracking() {
 	ecgTrackingReady = false;
 	ecgPeakArmed = false;
 	ecgHeartRate = -1;
 	ecgEnvelope = 0;
 	ecgPreviousDelta = 0;
-	if (buzzerActive) {
-		noTone(BUZZER_PIN);
-		buzzerActive = false;
-		buzzerDurationMs = 0;
-	}
+	lastEcgBeatMs = 0;
+	lastValidEcgBeatMs = 0;
+	stopBuzzer();
 	syncHeartRateSource();
+	}
+
+void resetMeasurementValues() {
+	gsrValue = 0;
+	ecgValue = 0;
+	ecgHeartRate = -1;
+	oximeterHeartRate = -1;
+	heartRate = -1;
+	spo2 = -1;
+	boardTempC = -1;
+	ecgFiltered = 0;
+	ecgBaseline = 512;
+	ecgEnvelope = 0;
+	ecgPreviousFiltered = 0;
+	ecgPreviousDelta = 0;
+	ecgLeadsOff = true;
+	baselineGsr = -1;
+	baselineHeartRate = -1;
+	baselineGsrSum = 0;
+	baselineHeartRateSum = 0;
+	baselineGsrSamples = 0;
+	baselineHeartRateSamples = 0;
+	measurementStartedMs = 0;
+	verdict = Verdict::Calibrating;
+	resetEcgTracking();
+	}
+
+void setDeviceMode(DeviceMode newMode) {
+	if (deviceMode == newMode) {
+		return;
+	}
+
+	deviceMode = newMode;
+	if (deviceMode == DeviceMode::Measuring) {
+		resetMeasurementValues();
+		measurementStartedMs = millis();
+		Serial.println(F("Mereni spusteno"));
+		playStartMeasurementTone();
+	} else if (deviceMode == DeviceMode::Paused) {
+		resetMeasurementValues();
+		Serial.println(F("Mereni pozastaveno"));
+		playPauseMeasurementTone();
+	} else {
+		resetMeasurementValues();
+		Serial.println(F("Pripraveno"));
+	}
+
+	refreshDisplay();
+	updateBacklight();
+	}
+
+void updateButtons(unsigned long now) {
+	const bool startReading = digitalRead(START_BUTTON_PIN);
+	const bool stopReading = digitalRead(STOP_BUTTON_PIN);
+
+	if (startReading != lastStartButtonReading) {
+		lastStartButtonChangeMs = now;
+		lastStartButtonReading = startReading;
+	}
+	if (stopReading != lastStopButtonReading) {
+		lastStopButtonChangeMs = now;
+		lastStopButtonReading = stopReading;
+	}
+
+	if (now - lastStartButtonChangeMs >= BUTTON_DEBOUNCE_MS && startReading != startButtonState) {
+		startButtonState = startReading;
+		if (startButtonState == LOW) {
+			setDeviceMode(DeviceMode::Measuring);
+		}
+	}
+
+	if (now - lastStopButtonChangeMs >= BUTTON_DEBOUNCE_MS && stopReading != stopButtonState) {
+		stopButtonState = stopReading;
+		if (stopButtonState == LOW) {
+			setDeviceMode(DeviceMode::Paused);
+		}
+	}
+	}
+
+void updateVerdict(unsigned long now) {
+	if (deviceMode != DeviceMode::Measuring) {
+		verdict = Verdict::Calibrating;
+		return;
+	}
+
+	if (gsrValue > 0) {
+		baselineGsrSum += gsrValue;
+		++baselineGsrSamples;
+	}
+	if (heartRate > 0) {
+		baselineHeartRateSum += heartRate;
+		++baselineHeartRateSamples;
+	}
+
+	if (measurementStartedMs == 0 || now - measurementStartedMs < BASELINE_CAPTURE_MS) {
+		verdict = Verdict::Calibrating;
+		return;
+	}
+
+	if (baselineGsr < 0 && baselineGsrSamples > 0) {
+		baselineGsr = static_cast<int>(baselineGsrSum / baselineGsrSamples);
+	}
+	if (baselineHeartRate < 0 && baselineHeartRateSamples > 0) {
+		baselineHeartRate = static_cast<int>(baselineHeartRateSum / baselineHeartRateSamples);
+	}
+
+	const int gsrDelta = baselineGsr >= 0 ? gsrValue - baselineGsr : 0;
+	const int heartRateDelta = (baselineHeartRate >= 0 && heartRate > 0) ? heartRate - baselineHeartRate : 0;
+	const bool stressDetected = gsrDelta >= GSR_LIE_DELTA || heartRateDelta >= HR_LIE_DELTA_BPM;
+	verdict = stressDetected ? Verdict::Lie : Verdict::Truth;
 	}
 
 void updateEcg(unsigned long now) {
@@ -375,11 +590,8 @@ bool initLcd() {
 	}
 
 	lcd.clear();
-	lcd.setRGB(180, 80, 0);
-	lcd.setCursor(0, 0);
-	lcd.print(F("Detektor LZI"));
-	lcd.setCursor(0, 1);
-	lcd.print(F("Startuji..."));
+	lcd.setRGB(MENU_BACKLIGHT_RED, MENU_BACKLIGHT_GREEN, MENU_BACKLIGHT_BLUE);
+	showStatusScreen("Pripraveno");
 	return true;
 	}
 
@@ -396,6 +608,26 @@ bool initOximeter() {
 
 void updateBacklight() {
 	if (!lcdReady) {
+		return;
+	}
+	if (deviceMode == DeviceMode::Standby) {
+		lcd.setRGB(MENU_BACKLIGHT_RED, MENU_BACKLIGHT_GREEN, MENU_BACKLIGHT_BLUE);
+		return;
+	}
+	if (deviceMode == DeviceMode::Paused) {
+		lcd.setRGB(PAUSED_BACKLIGHT_RED, PAUSED_BACKLIGHT_GREEN, PAUSED_BACKLIGHT_BLUE);
+		return;
+	}
+	if (verdict == Verdict::Calibrating) {
+		lcd.setRGB(180, 120, 0);
+		return;
+	}
+	if (verdict == Verdict::Lie) {
+		lcd.setRGB(255, 0, 0);
+		return;
+	}
+	if (verdict == Verdict::Truth) {
+		lcd.setRGB(0, 180, 0);
 		return;
 	}
 	if (!oximeterReady) {
@@ -423,11 +655,20 @@ void refreshDisplay() {
 	if (!lcdReady) {
 		return;
 	}
+	if (deviceMode == DeviceMode::Standby) {
+		showStatusScreen("Pripraveno");
+		return;
+	}
+	if (deviceMode == DeviceMode::Paused) {
+		showStatusScreen("Pozastaveno");
+		return;
+	}
 
 	char hrBuffer[6];
 	char ecgBuffer[6];
 	char spo2Buffer[6];
 	char tempBuffer[6];
+	char verdictBuffer[7];
 	char line1[17];
 	char line2[17];
 
@@ -439,9 +680,16 @@ void refreshDisplay() {
 	}
 	formatMaybeInt(spo2Buffer, sizeof(spo2Buffer), spo2);
 	formatMaybeInt(tempBuffer, sizeof(tempBuffer), boardTempC);
+	if (verdict == Verdict::Calibrating) {
+		snprintf(verdictBuffer, sizeof(verdictBuffer), "KALIB");
+	} else if (verdict == Verdict::Lie) {
+		snprintf(verdictBuffer, sizeof(verdictBuffer), "LEZ");
+	} else {
+		snprintf(verdictBuffer, sizeof(verdictBuffer), "PRAVDA");
+	}
 
 	snprintf(line1, sizeof(line1), "G%4d H%3s E%4s", gsrValue, hrBuffer, ecgBuffer);
-	snprintf(line2, sizeof(line2), "O2 %3s%% T%2sC", spo2Buffer, tempBuffer);
+	snprintf(line2, sizeof(line2), "%s O2%s T%s", verdictBuffer, spo2Buffer, tempBuffer);
 
 	lcd.setCursor(0, 0);
 	for (uint8_t i = 0; i < LCD_COLS; ++i) {
@@ -454,6 +702,15 @@ void refreshDisplay() {
 	}
 
 void printStatusToSerial() {
+	Serial.print(F("Mode="));
+	if (deviceMode == DeviceMode::Standby) {
+		Serial.print(F("READY"));
+	} else if (deviceMode == DeviceMode::Paused) {
+		Serial.print(F("PAUSED"));
+	} else {
+		Serial.print(F("MEASURE"));
+	}
+	Serial.print(F(" | "));
 	Serial.print(F("GSR="));
 	Serial.print(gsrValue);
 	Serial.print(F(" | ECG="));
@@ -494,6 +751,14 @@ void printStatusToSerial() {
 	Serial.print(lcdReady ? F("OK") : F("ERR"));
 	Serial.print(F(" | OX="));
 	Serial.println(oximeterReady ? F("OK") : F("WAIT"));
+	Serial.print(F("Verdict="));
+	if (verdict == Verdict::Calibrating) {
+		Serial.println(F("CALIBRATING"));
+	} else if (verdict == Verdict::Lie) {
+		Serial.println(F("LIE"));
+	} else {
+		Serial.println(F("TRUTH"));
+	}
 	Serial.println(F("Cmd: s=scan, c=clear, b=buzzer test"));
 	}
 
@@ -520,18 +785,21 @@ void setup() {
 	pinMode(ECG_LO_MINUS_PIN, INPUT);
 	pinMode(ECG_LO_PLUS_PIN, INPUT);
 	pinMode(BUZZER_PIN, OUTPUT);
+	pinMode(START_BUTTON_PIN, INPUT_PULLUP);
+	pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
 	noTone(BUZZER_PIN);
 	Wire.begin();
 	Wire.setClock(100000);
 
 	Serial.println();
 	Serial.println(F("Detektor LZI"));
-	Serial.println(F("UNO: SDA=A4, SCL=A5, GSR=A0, AD8232=A1 D2 D3, BUZ=D5"));
+	Serial.println(F("UNO: SDA=A4, SCL=A5, GSR=A0, AD8232=A1 D2 D3, BUZ=D5, BTN=D8 D9"));
 	scanI2CBus();
 
 	lcdReady = initLcd();
 	oximeterReady = initOximeter();
-	gsrValue = sampleGsr();
+	playStartupMelody();
+	setDeviceMode(DeviceMode::Standby);
 
 	if (lcdReady) {
 		refreshDisplay();
@@ -550,24 +818,27 @@ void setup() {
 
 void loop() {
 	const unsigned long now = millis();
+	updateButtons(now);
 
-	if (now - lastGsrSampleMs >= GSR_SAMPLE_INTERVAL_MS) {
+	if (deviceMode == DeviceMode::Measuring && now - lastGsrSampleMs >= GSR_SAMPLE_INTERVAL_MS) {
 		gsrValue = sampleGsr();
+		updateVerdict(now);
 		lastGsrSampleMs = now;
 	}
 
-	if (now - lastEcgSampleMs >= ECG_SAMPLE_INTERVAL_MS) {
+	if (deviceMode == DeviceMode::Measuring && now - lastEcgSampleMs >= ECG_SAMPLE_INTERVAL_MS) {
 		updateEcg(now);
 		lastEcgSampleMs = now;
 	}
 
-	if (!oximeterReady && now - lastOximeterRetryMs >= OXIMETER_RETRY_INTERVAL_MS) {
+	if (deviceMode == DeviceMode::Measuring && !oximeterReady && now - lastOximeterRetryMs >= OXIMETER_RETRY_INTERVAL_MS) {
 		oximeterReady = initOximeter();
 		lastOximeterRetryMs = now;
 	}
 
-	if (oximeterReady && now - lastOximeterReadMs >= OXIMETER_READ_INTERVAL_MS) {
+	if (deviceMode == DeviceMode::Measuring && oximeterReady && now - lastOximeterReadMs >= OXIMETER_READ_INTERVAL_MS) {
 		updateOximeter();
+		updateVerdict(now);
 		lastOximeterReadMs = now;
 	}
 
